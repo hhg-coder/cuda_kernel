@@ -173,44 +173,45 @@ __global__ void sgemm_gpu_kernel_v2(float *__restrict__ A,
     C[index_C] = c;
 }
 
-void __global__ gemm_kernel_fix_2(float* A, float* B, float* C, 
-    const int M, const int N, const int K){
-    const int BM = 16;
-    const int BN = 16;
-    const int BK = 64;
-    __shared__ float sm_a[BM][BK];
-    __shared__ float sm_b[BK][BN];
+__global__ void gemm_kernel_float4(const float* __restrict__ A, const float* __restrict__ B, float* C,
+                                   int M, int N, int K) {
+    const int BM = 16, BN = 16, BK = 64;
+    __shared__ float sm_a[BM * BK];
+    __shared__ float sm_b[BK * BN];
 
     int row = blockIdx.y * BM + threadIdx.y;
     int col = blockIdx.x * BN + threadIdx.x;
+
     float c = 0.0f;
 
-    for (int step = 0; step < K / BK; ++step) {
-        // load A block to shared memory
-        for (int k = threadIdx.x; k < BK; k += BN) {
-            if (row < M && (step * BK + k) < K)
-                sm_a[threadIdx.y][k] = A[row * K + step * BK + k];
-            else
-                sm_a[threadIdx.y][k] = 0.0f;
+    for (int step = 0; step < K; step += BK) {
+        // float4访存：threadIdx.x每次+4，保证对齐
+        for (int k = threadIdx.x * 4; k < BK; k += blockDim.x * 4) {
+            int a_g_idx = row * K + step + k;
+            int a_s_idx = threadIdx.y * BK + k;
+            if (row < M && (step + k + 3) < K) {
+                reinterpret_cast<float4*>(&sm_a[a_s_idx])[0] = reinterpret_cast<const float4*>(&A[a_g_idx])[0];
+            }
         }
-        // load B block to shared memory
-        for (int k = threadIdx.y; k < BK; k += BM) {
-            if ((step * BK + k) < K && col < N)
-                sm_b[k][threadIdx.x] = B[(step * BK + k) * N + col];
-            else
-                sm_b[k][threadIdx.x] = 0.0f;
+        for (int k = threadIdx.y * 4; k < BK; k += blockDim.y * 4) {
+            int b_g_idx = (step + k) * N + col;
+            int b_s_idx = k * BN + threadIdx.x;
+            if (col < N && (step + k + 3) < K) {
+                reinterpret_cast<float4*>(&sm_b[b_s_idx])[0] = reinterpret_cast<const float4*>(&B[b_g_idx])[0];
+            }
         }
         __syncthreads();
 
         for (int k = 0; k < BK; ++k) {
-            c += sm_a[threadIdx.y][k] * sm_b[k][threadIdx.x];
+            float a = sm_a[threadIdx.y * BK + k];
+            float b = sm_b[k * BN + threadIdx.x];
+            c += a * b;
         }
         __syncthreads();
     }
 
     if (row < M && col < N)
         C[row * N + col] = c;
-
 }
 
 void __global__ gemm_kernel_2(float* A, float* B, float* C, 
@@ -252,6 +253,177 @@ void __global__ gemm_kernel_2(float* A, float* B, float* C,
 
 }
 
+void __global__ gemm_kernel_gemini_pro_2(float* A, float* B, float* C, 
+    const int M, const int N, const int K){
+    const int BM = 16;
+    const int BN = 16;
+    const int BK = 64;
+
+    // 使用一维数组简化 float4 访问
+    __shared__ float sm_a[BM * BK];
+    __shared__ float sm_b[BK * BN];
+
+    // 每个线程负责计算C的一个元素
+    const int row = blockIdx.y * BM + threadIdx.y;
+    const int col = blockIdx.x * BN + threadIdx.x;
+
+    // 用于加载数据的线程ID
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int threads_per_block = blockDim.x * blockDim.y;
+
+    float c = 0.0f;
+
+    for (int step = 0; step < K; step += BK){
+        // --- 加载 sm_a ---
+        // 每个线程加载 1024 / 256 = 4 个元素
+        // (BM * BK) / threads_per_block = (16 * 64) / 256 = 4
+        for (int i = 0; i < (BM * BK) / threads_per_block; ++i) {
+            const int idx = tid + i * threads_per_block;
+            const int sm_a_row = idx / BK;
+            const int sm_a_col = idx % BK;
+
+            const int gmem_a_row = blockIdx.y * BM + sm_a_row;
+            const int gmem_a_col = step + sm_a_col;
+
+            if (gmem_a_row < M && gmem_a_col < K) {
+                sm_a[idx] = A[gmem_a_row * K + gmem_a_col];
+            } else {
+                sm_a[idx] = 0.0f;
+            }
+        }
+
+        // --- 加载 sm_b ---
+        // (BK * BN) / threads_per_block = (64 * 16) / 256 = 4
+        for (int i = 0; i < (BK * BN) / threads_per_block; ++i) {
+            const int idx = tid + i * threads_per_block;
+            const int sm_b_row = idx / BN;
+            const int sm_b_col = idx % BN;
+
+            const int gmem_b_row = step + sm_b_row;
+            const int gmem_b_col = blockIdx.x * BN + sm_b_col;
+
+            if (gmem_b_row < K && gmem_b_col < N) {
+                sm_b[idx] = B[gmem_b_row * N + gmem_b_col];
+            } else {
+                sm_b[idx] = 0.0f;
+            }
+        }
+        
+        __syncthreads();
+
+        // --- 计算 ---
+        // 每个线程使用 sm_a 的一行和 sm_b 的一列
+        for (int k = 0; k < BK; k++){
+            c += sm_a[threadIdx.y * BK + k] * sm_b[k * BN + threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    // --- 写回结果 ---
+    if (row < M && col < N){
+        C[row * N + col] = c;
+    }
+}
+
+void __global__ gemm_gemini_float4_fixed(float* A, float* B, float* C, 
+    const int M, const int N, const int K){
+    const int BM = 16;
+    const int BN = 16;
+    const int BK = 64;
+
+    __shared__ float sm_a[BM * BK];
+    __shared__ float sm_b[BK * BN];
+
+    const int row = blockIdx.y * BM + threadIdx.y;
+    const int col = blockIdx.x * BN + threadIdx.x;
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int threads_per_block = blockDim.x * blockDim.y;
+
+    float c = 0.0f;
+
+    for (int step = 0; step < K; step += BK){
+        // 加载矩阵A - 使用float4合并访问
+        // 每个线程负责加载4个连续的float元素
+        const int loads_per_thread = (BM * BK / 4) / threads_per_block;
+        for (int i = 0; i < loads_per_thread; ++i) {
+            const int f4_idx = tid + i * threads_per_block;
+            const int sm_idx = f4_idx * 4;
+            
+            if (sm_idx < BM * BK) {
+                const int sm_row = sm_idx / BK;
+                const int sm_col = sm_idx % BK;
+                const int gmem_row = blockIdx.y * BM + sm_row;
+                const int gmem_col = step + sm_col;
+                
+                if (gmem_row < M && (gmem_col + 3) < K) {
+                    // 使用float4进行合并访问
+                    float4 temp = reinterpret_cast<float4*>(A)[(gmem_row * K + gmem_col) / 4];
+                    sm_a[sm_idx + 0] = temp.x;
+                    sm_a[sm_idx + 1] = temp.y;
+                    sm_a[sm_idx + 2] = temp.z;
+                    sm_a[sm_idx + 3] = temp.w;
+                } else {
+                    // 边界处理
+                    for (int j = 0; j < 4 && (sm_idx + j) < BM * BK; ++j) {
+                        int cur_gmem_col = gmem_col + j;
+                        if (gmem_row < M && cur_gmem_col < K) {
+                            sm_a[sm_idx + j] = A[gmem_row * K + cur_gmem_col];
+                        } else {
+                            sm_a[sm_idx + j] = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 加载矩阵B - 使用float4合并访问
+        const int loads_per_thread_b = (BK * BN / 4) / threads_per_block;
+        for (int i = 0; i < loads_per_thread_b; ++i) {
+            const int f4_idx = tid + i * threads_per_block;
+            const int sm_idx = f4_idx * 4;
+            
+            if (sm_idx < BK * BN) {
+                const int sm_row = sm_idx / BN;
+                const int sm_col = sm_idx % BN;
+                const int gmem_row = step + sm_row;
+                const int gmem_col = blockIdx.x * BN + sm_col;
+                
+                if (gmem_row < K && (gmem_col + 3) < N) {
+                    // 使用float4进行合并访问
+                    float4 temp = reinterpret_cast<float4*>(B)[(gmem_row * N + gmem_col) / 4];
+                    sm_b[sm_idx + 0] = temp.x;
+                    sm_b[sm_idx + 1] = temp.y;
+                    sm_b[sm_idx + 2] = temp.z;
+                    sm_b[sm_idx + 3] = temp.w;
+                } else {
+                    // 边界处理
+                    for (int j = 0; j < 4 && (sm_idx + j) < BK * BN; ++j) {
+                        int cur_gmem_col = gmem_col + j;
+                        if (gmem_row < K && cur_gmem_col < N) {
+                            sm_b[sm_idx + j] = B[gmem_row * N + cur_gmem_col];
+                        } else {
+                            sm_b[sm_idx + j] = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+        
+        __syncthreads();
+
+        // 计算
+        for (int k = 0; k < BK; k++){
+            c += sm_a[threadIdx.y * BK + k] * sm_b[k * BN + threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    // 写回结果
+    if (row < M && col < N){
+        C[row * N + col] = c;
+    }
+}
+
 void launch_kernel_2(){
     int M = 1024;
     int N = 1024;
@@ -281,7 +453,7 @@ void launch_kernel_2(){
     int warm_up = 2;
     int repeat = 5;
     for (int i = 0; i < warm_up; i++){
-        gemm_kernel_fix_2<<<gridSize, blockSize>>>(d_A, d_B, d_C, M, N, K);
+        gemm_gemini_float4_fixed<<<gridSize, blockSize>>>(d_A, d_B, d_C, M, N, K);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -291,7 +463,7 @@ void launch_kernel_2(){
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
         cudaEventRecord(start, 0);
-        gemm_kernel_fix_2<<<gridSize, blockSize>>>(d_A, d_B, d_C, M, N, K);
+        gemm_gemini_float4_fixed<<<gridSize, blockSize>>>(d_A, d_B, d_C, M, N, K);
         cudaEventRecord(stop, 0);
         cudaEventSynchronize(stop);
         float kernel_time = 0.0f;
@@ -331,7 +503,7 @@ void launch_kernel_2(){
 }
 
 int main(){
-    launch_kernel_1();
+    // launch_kernel_1();
     printf("=============\n");
     launch_kernel_2();
     return 0;
